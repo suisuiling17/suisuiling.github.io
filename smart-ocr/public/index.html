@@ -275,7 +275,7 @@ tbody tr:hover{background:var(--bg);}
                 <div class="upload-icon">📂</div>
                 <h2>点击或拖拽上传图片</h2>
                 <p>支持 JPG / PNG / WEBP / BMP</p>
-                <div class="upload-types">推荐图片清晰、文字水平拍摄</div>
+                <div class="upload-types">识别后会自动以「活动名称」重命名文件</div>
                 <div class="upload-buttons">
                     <button class="btn btn-primary" onclick="event.stopPropagation();openFilePicker();">选择图片</button>
                 </div>
@@ -298,8 +298,9 @@ tbody tr:hover{background:var(--bg);}
                 <p>① 图片会压缩至 1600px 宽后上传，节省流量。</p>
                 <p>② GLM-4.6V-Flash 会同时返回识别全文和结构化字段。</p>
                 <p>③ 字段包括：活动名称、时间、地点、主办单位、参与人员。</p>
-                <p>④ 系统根据关键词进一步分类和打标签。</p>
-                <p>⑤ ⚠️ 请勿上传身份证、银行卡等敏感文件。</p>
+                <p>④ <b>文件将自动以「活动名称」命名</b>，原始文件名保留在详情页。</p>
+                <p>⑤ 系统根据关键词进一步分类和打标签。</p>
+                <p>⑥ ⚠️ 请勿上传身份证、银行卡等敏感文件。</p>
             </div>
         </div>
     </div>
@@ -395,6 +396,7 @@ tbody tr:hover{background:var(--bg);}
         </div>
         <div class="modal-body">
             <input type="hidden" id="editId">
+            <div class="form-group"><label class="form-label">文件名</label><input class="form-input" id="editName"></div>
             <div class="form-group"><label class="form-label">事件名称</label><input class="form-input" id="editEvent"></div>
             <div class="form-group"><label class="form-label">分类</label><select class="form-select" id="editCategory"></select></div>
             <div class="form-group"><label class="form-label">时间</label><input class="form-input" id="editTime"></div>
@@ -610,9 +612,22 @@ async function processFile(file, index, total) {
         const parsed = parseGLMResponse(data.text);
         const analysis = analyzeContent(parsed.全文 || data.text, file.name);
 
+        // ============ 智能命名：以「活动名称」为文件名 ============
+        const rawName = (parsed.活动名称 || analysis.event || file.name).trim();
+        // 过滤不合法字符
+        const safeName = rawName
+            .replace(/[\\/:*?"<>|]/g, '_')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .substring(0, 60) || '未命名';
+        // 保留原扩展名
+        const ext = (file.name.match(/\.[^/.]+$/) || ['.jpg'])[0];
+        const finalName = safeName + ext;
+
         const record = {
             id: Date.now().toString() + Math.random().toString(36).substring(2),
-            name: file.name,
+            name: finalName,              // 显示名：自动以活动名称命名
+            originalName: file.name,      // 原始文件名，保留追溯
             type: file.type || "unknown",
             size: file.size,
             createdAt: new Date().toISOString(),
@@ -621,7 +636,7 @@ async function processFile(file, index, total) {
             category: analysis.category,
             time: parsed.时间 || analysis.time,
             location: parsed.地点 || analysis.location,
-            people: parsed.参与人员 || parsed.主办单位 || analysis.people,
+            people: cleanPeople(parsed.参与人员 || parsed.主办单位 || analysis.people),
             tags: analysis.tags,
             imageData: null
         };
@@ -632,8 +647,8 @@ async function processFile(file, index, total) {
         saveDocuments();
 
         progressBar.style.width = "100%";
-        progressText.textContent = `✓ ${file.name} 识别完成`;
-        await sleep(300);
+        progressText.textContent = `✓ 已识别并命名为：${finalName}`;
+        await sleep(500);
 
     } catch (error) {
         console.error(error);
@@ -642,33 +657,69 @@ async function processFile(file, index, total) {
     }
 }
 
+/* =========================================================
+   修复版 JSON 解析：兼容 ```json 包裹、前后有解释文字等情况
+========================================================= */
 function parseGLMResponse(raw) {
     if (!raw) return { 全文: "" };
 
-    let text = raw.trim();
-    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) text = jsonMatch[1].trim();
+    let text = String(raw).trim();
 
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start !== -1 && end !== -1 && end > start) {
-        const jsonStr = text.substring(start, end + 1);
-        try {
-            const obj = JSON.parse(jsonStr);
-            return {
-                活动名称: obj.活动名称 || obj["活动名称"] || "",
-                时间: obj.时间 || "",
-                地点: obj.地点 || "",
-                主办单位: obj.主办单位 || "",
-                参与人员: obj.参与人员 || "",
-                全文: obj.全文 || obj["完整内容"] || raw
-            };
-        } catch(e) {
-            console.warn("JSON 解析失败:", e, jsonStr);
+    // 1. 优先尝试提取 ```json ... ``` 代码块
+    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (codeBlockMatch) {
+        text = codeBlockMatch[1].trim();
+    }
+
+    // 2. 尝试直接解析整段
+    const tryParse = (str) => {
+        try { return JSON.parse(str); } catch (e) { return null; }
+    };
+
+    let obj = tryParse(text);
+
+    // 3. 如果直接解析失败，尝试从第一个 { 到最后一个 } 截取
+    if (!obj) {
+        const start = text.indexOf('{');
+        const end = text.lastIndexOf('}');
+        if (start !== -1 && end > start) {
+            obj = tryParse(text.substring(start, end + 1));
         }
     }
 
+    // 4. 解析成功则返回结构化字段
+    if (obj && typeof obj === 'object') {
+        return {
+            活动名称: obj.活动名称 || obj["活动名称"] || obj.event || "",
+            时间: obj.时间 || obj.time || "",
+            地点: obj.地点 || obj.location || "",
+            主办单位: obj.主办单位 || obj.organization || "",
+            参与人员: obj.参与人员 || obj.people || obj.参与人 || "",
+            全文: obj.全文 || obj["完整内容"] || obj.text || raw
+        };
+    }
+
+    // 5. 全部失败，返回原文
     return { 全文: raw };
+}
+
+/* =========================================================
+   人物字段清洗：去掉冗长的描述，只留核心人名/单位
+========================================================= */
+function cleanPeople(rawText) {
+    if (!rawText || rawText === "--") return "--";
+
+    // 优先匹配"姓名：xxx"
+    const nameMatch = rawText.match(/姓\s*名[：:]\s*([^\s，。,\n]{2,10})/);
+    if (nameMatch) return nameMatch[1];
+
+    // 优先匹配"负责人：xxx"
+    const leaderMatch = rawText.match(/负责人[：:]\s*([^\s，。,\n]{2,15})/);
+    if (leaderMatch) return leaderMatch[1];
+
+    // 否则截取合理长度
+    const cleaned = rawText.replace(/\s+/g, ' ').trim();
+    return cleaned.length > 80 ? cleaned.substring(0, 80) + '…' : cleaned;
 }
 
 function compressToBase64(file, maxWidth, quality) {
@@ -868,7 +919,7 @@ function renderLibrary() {
     const query = (document.getElementById("librarySearch")?.value || "").trim().toLowerCase();
 
     let list = documents.filter(d => {
-        const searchable = [d.name, d.event, d.category, d.time, d.location, d.people, d.text, ...(d.tags || [])].join(" ").toLowerCase();
+        const searchable = [d.name, d.originalName, d.event, d.category, d.time, d.location, d.people, d.text, ...(d.tags || [])].join(" ").toLowerCase();
         const matchesSearch = !query || searchable.includes(query);
         const matchesFilter = currentFilter === "全部" || d.category === currentFilter;
         return matchesSearch && matchesFilter;
@@ -932,7 +983,7 @@ function smartSearch() {
     const keywords = cleaned.split(/\s+|，|,|、/).filter(Boolean);
 
     const result = documents.filter(d => {
-        const text = [d.name, d.event, d.category, d.time, d.location, d.people, d.text, ...(d.tags || [])].join(" ").toLowerCase();
+        const text = [d.name, d.originalName, d.event, d.category, d.time, d.location, d.people, d.text, ...(d.tags || [])].join(" ").toLowerCase();
         if (!keywords.length) return text.includes(query);
         return keywords.some(k => text.includes(k));
     });
@@ -1008,7 +1059,8 @@ function showDetail(id) {
                 <div class="detail-section">
                     <h3>文件信息</h3>
                     <div class="info-grid">
-                        <div class="info-box"><label>文件名</label><span>${escapeHTML(d.name)}</span></div>
+                        <div class="info-box"><label>文件名（自动命名）</label><span>${escapeHTML(d.name)}</span></div>
+                        <div class="info-box"><label>原始文件名</label><span>${escapeHTML(d.originalName || "--")}</span></div>
                         <div class="info-box"><label>大小</label><span>${formatSize(d.size)}</span></div>
                     </div>
                 </div>
@@ -1034,6 +1086,7 @@ function editDocument(id) {
     if (!d) return;
 
     document.getElementById("editId").value = d.id;
+    document.getElementById("editName").value = d.name || "";
     document.getElementById("editEvent").value = d.event || "";
     document.getElementById("editTime").value = d.time || "";
     document.getElementById("editLocation").value = d.location || "";
@@ -1053,6 +1106,7 @@ function saveEdit() {
     const d = documents.find(x => x.id === id);
     if (!d) return;
 
+    d.name = document.getElementById("editName").value.trim() || d.name;
     d.event = document.getElementById("editEvent").value.trim();
     d.category = document.getElementById("editCategory").value;
     d.time = document.getElementById("editTime").value.trim();
